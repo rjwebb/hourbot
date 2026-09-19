@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+Opens a Discord category for a fixed window each day, then closes it again.
+
+Requires: discord.py >= 2.3, Python >= 3.9
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+from zoneinfo import ZoneInfo
+
+import discord
+from discord.ext import tasks
+
+log = logging.getLogger("hourbot")
+
+
+def _require(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit(f"missing required environment variable: {name}")
+    return value
+
+
+TOKEN = _require("DISCORD_TOKEN")
+GUILD_ID = int(_require("GUILD_ID"))
+CATEGORY_ID = int(_require("CATEGORY_ID"))
+LOBBY_CHANNEL_ID = int(os.environ.get("LOBBY_CHANNEL_ID") or 0)
+TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/London"))
+OPEN_AT = dt.time.fromisoformat(os.environ.get("OPEN_TIME", "21:00"))
+DURATION = dt.timedelta(minutes=int(os.environ.get("OPEN_MINUTES", "60")))
+MODE = os.environ.get("MODE", "hide").lower()
+
+if MODE not in ("hide", "lock"):
+    raise SystemExit("MODE must be 'hide' or 'lock'")
+if not dt.timedelta(0) < DURATION < dt.timedelta(days=1):
+    raise SystemExit("OPEN_MINUTES must be between 1 and 1439")
+
+# The permission we toggle. "hide" removes the channels entirely; "lock" leaves
+# them readable so last night's conversation is still there in the morning.
+PERM = "view_channel" if MODE == "hide" else "send_messages"
+
+# Boundary times for the scheduler. Attaching a real zone (not a fixed UTC
+# offset) is what keeps the opening hour fixed in local time across DST.
+_CLOSE_AT = (dt.datetime.combine(dt.date(2000, 1, 1), OPEN_AT) + DURATION).time()
+BOUNDARIES = [OPEN_AT.replace(tzinfo=TZ), _CLOSE_AT.replace(tzinfo=TZ)]
+
+def _opening_on(day: dt.date) -> dt.datetime:
+    return dt.datetime.combine(day, OPEN_AT, tzinfo=TZ)
+
+
+def is_open(now: dt.datetime) -> bool:
+    """True if now falls inside a window. Checks yesterday too, for windows
+    that run past midnight."""
+    for offset in (0, -1):
+        start = _opening_on(now.date() + dt.timedelta(days=offset))
+        if start <= now < start + DURATION:
+            return True
+    return False
+
+
+def next_opening(now: dt.datetime) -> dt.datetime:
+    for offset in (0, 1, 2):
+        start = _opening_on(now.date() + dt.timedelta(days=offset))
+        if start > now:
+            return start
+    raise RuntimeError("unreachable")
+
+
+intents = discord.Intents.none()
+intents.guilds = True
+client = discord.Client(intents=intents)
+
+
+async def apply_state() -> None:
+    """Bring the category in line with the clock. Idempotent and cheap: makes
+    no API call when the permissions are already correct."""
+    guild = client.get_guild(GUILD_ID)
+    if guild is None:
+        log.warning("guild %s not in cache, skipping", GUILD_ID)
+        return
+
+    category = guild.get_channel(CATEGORY_ID)
+    if category is None:
+        log.error("channel %s not found", CATEGORY_ID)
+        return
+
+    now = dt.datetime.now(TZ)
+    want = is_open(now)
+
+    overwrite = category.overwrites_for(guild.default_role)
+    if getattr(overwrite, PERM) is not want:
+        setattr(overwrite, PERM, want)
+        await category.set_permissions(
+            guild.default_role,
+            overwrite=overwrite,
+            reason="scheduled opening hours",
+        )
+        log.info("category now %s (%s=%s)", "open" if want else "closed", PERM, want)
+
+    await update_lobby(guild, want, now)
+
+
+async def update_lobby(guild: discord.Guild, open_now: bool, now: dt.datetime) -> None:
+    if not LOBBY_CHANNEL_ID:
+        return
+    channel = guild.get_channel(LOBBY_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    if open_now:
+        closes = _opening_on(now.date()) + DURATION
+        if closes <= now:  # window started yesterday
+            closes = _opening_on(now.date() - dt.timedelta(days=1)) + DURATION
+        topic = f"Open now — closes at {closes:%H:%M %Z}."
+    else:
+        topic = f"Closed. Opens {next_opening(now):%A %H:%M %Z}."
+
+    if channel.topic != topic:
+        await channel.edit(topic=topic, reason="scheduled opening hours")
+
+
+@tasks.loop(time=BOUNDARIES)
+async def on_boundary() -> None:
+    try:
+        await apply_state()
+    except discord.HTTPException:
+        log.exception("boundary update failed; reconcile loop will retry")
+
+
+@tasks.loop(minutes=10)
+async def reconcile() -> None:
+    """Safety net for a boundary missed during a disconnect."""
+    log.info("reconcile: %s", "open" if is_open(dt.datetime.now(TZ)) else "closed")
+    try:
+        await apply_state()
+    except discord.HTTPException:
+        log.exception("reconcile failed")
+
+
+@on_boundary.before_loop
+@reconcile.before_loop
+async def _wait_ready() -> None:
+    await client.wait_until_ready()
+
+
+@client.event
+async def on_ready() -> None:
+    log.info("connected as %s", client.user)
+
+    guild = client.get_guild(GUILD_ID)
+    category = guild and guild.get_channel(CATEGORY_ID)
+    if isinstance(category, discord.CategoryChannel):
+        stray = [c.name for c in category.channels if not c.permissions_synced]
+        if stray:
+            log.warning(
+                "these channels don't inherit from the category and won't be "
+                "opened or closed: %s — right-click each and Sync Permissions",
+                ", ".join(stray),
+            )
+
+    if not on_boundary.is_running():
+        on_boundary.start()
+    if not reconcile.is_running():
+        reconcile.start()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    client.run(TOKEN, log_handler=None)
