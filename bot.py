@@ -9,6 +9,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -16,58 +17,52 @@ import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-load_dotenv()
+from hours import Schedule
 
 log = logging.getLogger("hourbot")
 
-TOKEN = os.environ["DISCORD_TOKEN"]
-GUILD_ID = int(os.environ["GUILD_ID"])
-CATEGORY_ID = int(os.environ["CATEGORY_ID"])
-LOBBY_CHANNEL_ID = int(os.environ.get("LOBBY_CHANNEL_ID") or 0)
-TZ = ZoneInfo(os.environ.get("TIMEZONE") or "Europe/London")
-OPEN_AT = dt.time.fromisoformat(os.environ.get("OPEN_TIME") or "21:00")
-DURATION = dt.timedelta(minutes=int(os.environ.get("OPEN_MINUTES") or 60))
-MODE = (os.environ.get("MODE") or "hide").lower()
 
-if MODE not in ("hide", "lock"):
-    raise SystemExit("MODE must be 'hide' or 'lock'")
-if not dt.timedelta(0) < DURATION < dt.timedelta(days=1):
-    raise SystemExit("OPEN_MINUTES must be between 1 and 1439")
+@dataclass(frozen=True)
+class Config:
+    token: str
+    guild_id: int
+    category_id: int
+    lobby_channel_id: int  # 0 = no lobby channel
+    mode: str  # "hide" or "lock"
+    schedule: Schedule
+
+
+def load_config() -> Config:
+    load_dotenv()
+    mode = (os.environ.get("MODE") or "hide").lower()
+    if mode not in ("hide", "lock"):
+        raise SystemExit("MODE must be 'hide' or 'lock'")
+    return Config(
+        token=os.environ["DISCORD_TOKEN"],
+        guild_id=int(os.environ["GUILD_ID"]),
+        category_id=int(os.environ["CATEGORY_ID"]),
+        lobby_channel_id=int(os.environ.get("LOBBY_CHANNEL_ID") or 0),
+        mode=mode,
+        schedule=Schedule(
+            tz=ZoneInfo(os.environ.get("TIMEZONE") or "Europe/London"),
+            open_at=dt.time.fromisoformat(os.environ.get("OPEN_TIME") or "21:00"),
+            duration=dt.timedelta(minutes=int(os.environ.get("OPEN_MINUTES") or 60)),
+        ),
+    )
+
+
+CFG = load_config()
+SCHEDULE = CFG.schedule
 
 # Permissions that follow the clock. "hide" removes the channels entirely;
 # "lock" leaves them readable (but not writable or reactable) so last night's
 # conversation is still there in the morning.
-TOGGLED = ("view_channel",) if MODE == "hide" else ("send_messages", "add_reactions")
+TOGGLED = ("view_channel",) if CFG.mode == "hide" else ("send_messages", "add_reactions")
 
 # Permissions that stay off regardless of the clock: no threads, ever.
 ALWAYS_OFF = ("create_public_threads", "create_private_threads", "send_messages_in_threads")
 
-# Boundary times for the scheduler. Attaching a real zone (not a fixed UTC
-# offset) is what keeps the opening hour fixed in local time across DST.
-_CLOSE_AT = (dt.datetime.combine(dt.date.min, OPEN_AT) + DURATION).time()
-BOUNDARIES = [OPEN_AT.replace(tzinfo=TZ), _CLOSE_AT.replace(tzinfo=TZ)]
-
-
-def _opening_on(day: dt.date) -> dt.datetime:
-    return dt.datetime.combine(day, OPEN_AT, tzinfo=TZ)
-
-
-def current_window(now: dt.datetime) -> Optional[dt.datetime]:
-    """Start of the window containing now, or None if closed. Checks
-    yesterday's window too, for windows that run past midnight."""
-    for offset in (0, -1):
-        start = _opening_on(now.date() + dt.timedelta(days=offset))
-        if start <= now < start + DURATION:
-            return start
-    return None
-
-
-def next_opening(now: dt.datetime) -> dt.datetime:
-    for offset in (0, 1):
-        start = _opening_on(now.date() + dt.timedelta(days=offset))
-        if start > now:
-            return start
-    raise RuntimeError("unreachable")
+MANAGED = TOGGLED + ALWAYS_OFF
 
 
 intents = discord.Intents.none()
@@ -75,21 +70,41 @@ intents.guilds = True
 client = discord.Client(intents=intents)
 
 
+async def ensure_own_access(guild: discord.Guild, category: discord.CategoryChannel) -> None:
+    """Give the bot an explicit allow for every permission it manages. Without
+    this, denying view_channel to @everyone hides the category from the bot
+    too, and Discord only lets us set overwrite bits we hold ourselves."""
+    me = guild.me
+    overwrite = category.overwrites_for(me)
+    missing = [p for p in MANAGED if getattr(overwrite, p) is not True]
+    if missing:
+        overwrite.update(**{p: True for p in missing})
+        await category.set_permissions(
+            me,
+            overwrite=overwrite,
+            reason="hourbot must keep access to the category it manages",
+        )
+        log.info("granted myself %s on the category", ", ".join(missing))
+
+
 async def apply_state() -> None:
     """Bring the category in line with the clock. Idempotent and cheap: makes
     no API call when the permissions are already correct."""
-    guild = client.get_guild(GUILD_ID)
+    guild = client.get_guild(CFG.guild_id)
     if guild is None:
-        log.warning("guild %s not in cache, skipping", GUILD_ID)
+        log.warning("guild %s not in cache, skipping", CFG.guild_id)
         return
 
-    category = guild.get_channel(CATEGORY_ID)
+    category = guild.get_channel(CFG.category_id)
     if not isinstance(category, discord.CategoryChannel):
-        log.error("category %s not found", CATEGORY_ID)
+        log.error("category %s not found", CFG.category_id)
         return
 
-    now = dt.datetime.now(TZ)
-    window = current_window(now)
+    # Must come before any write to @everyone, or we lock ourselves out.
+    await ensure_own_access(guild, category)
+
+    now = dt.datetime.now(SCHEDULE.tz)
+    window = SCHEDULE.current_window(now)
     want = window is not None
 
     wanted = {perm: want for perm in TOGGLED}
@@ -116,16 +131,16 @@ async def apply_state() -> None:
 async def update_lobby(
     guild: discord.Guild, window: Optional[dt.datetime], now: dt.datetime
 ) -> None:
-    if not LOBBY_CHANNEL_ID:
+    if not CFG.lobby_channel_id:
         return
-    channel = guild.get_channel(LOBBY_CHANNEL_ID)
+    channel = guild.get_channel(CFG.lobby_channel_id)
     if not isinstance(channel, discord.TextChannel):
         return
 
     if window is not None:
-        topic = f"Open now — closes at {window + DURATION:%H:%M %Z}."
+        topic = f"Open now — closes at {window + SCHEDULE.duration:%H:%M %Z}."
     else:
-        topic = f"Closed. Opens {next_opening(now):%A %H:%M %Z}."
+        topic = f"Closed. Opens {SCHEDULE.next_opening(now):%A %H:%M %Z}."
 
     if channel.topic != topic:
         await channel.edit(topic=topic, reason="scheduled opening hours")
@@ -138,7 +153,7 @@ async def _apply_safely(what: str) -> None:
         log.exception("%s failed", what)
 
 
-@tasks.loop(time=BOUNDARIES)
+@tasks.loop(time=SCHEDULE.boundaries)
 async def on_boundary() -> None:
     # asyncio can wake a hair before the scheduled time; make sure the clock
     # has actually crossed the boundary before we read it.
@@ -162,8 +177,8 @@ async def _wait_ready() -> None:
 async def on_ready() -> None:
     log.info("connected as %s", client.user)
 
-    guild = client.get_guild(GUILD_ID)
-    category = guild.get_channel(CATEGORY_ID) if guild else None
+    guild = client.get_guild(CFG.guild_id)
+    category = guild.get_channel(CFG.category_id) if guild else None
     if isinstance(category, discord.CategoryChannel):
         stray = [c.name for c in category.channels if not c.permissions_synced]
         if stray:
@@ -185,4 +200,4 @@ if __name__ == "__main__":
         format="%(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("discord").setLevel(logging.WARNING)
-    client.run(TOKEN, log_handler=None)
+    client.run(CFG.token, log_handler=None)
