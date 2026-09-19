@@ -34,9 +34,13 @@ if MODE not in ("hide", "lock"):
 if not dt.timedelta(0) < DURATION < dt.timedelta(days=1):
     raise SystemExit("OPEN_MINUTES must be between 1 and 1439")
 
-# The permission we toggle. "hide" removes the channels entirely; "lock" leaves
-# them readable so last night's conversation is still there in the morning.
-PERM = "view_channel" if MODE == "hide" else "send_messages"
+# Permissions that follow the clock. "hide" removes the channels entirely;
+# "lock" leaves them readable (but not writable or reactable) so last night's
+# conversation is still there in the morning.
+TOGGLED = ("view_channel",) if MODE == "hide" else ("send_messages", "add_reactions")
+
+# Permissions that stay off regardless of the clock: no threads, ever.
+ALWAYS_OFF = ("create_public_threads", "create_private_threads", "send_messages_in_threads")
 
 # Boundary times for the scheduler. Attaching a real zone (not a fixed UTC
 # offset) is what keeps the opening hour fixed in local time across DST.
@@ -88,15 +92,23 @@ async def apply_state() -> None:
     window = current_window(now)
     want = window is not None
 
+    wanted = {perm: want for perm in TOGGLED}
+    wanted.update({perm: False for perm in ALWAYS_OFF})
+
     overwrite = category.overwrites_for(guild.default_role)
-    if getattr(overwrite, PERM) is not want:
-        setattr(overwrite, PERM, want)
+    changed = {p: v for p, v in wanted.items() if getattr(overwrite, p) is not v}
+    if changed:
+        overwrite.update(**changed)
         await category.set_permissions(
             guild.default_role,
             overwrite=overwrite,
             reason="scheduled opening hours",
         )
-        log.info("category now %s (%s=%s)", "open" if want else "closed", PERM, want)
+        log.info(
+            "category now %s (%s)",
+            "open" if want else "closed",
+            ", ".join(f"{p}={v}" for p, v in changed.items()),
+        )
 
     await update_lobby(guild, window, now)
 
