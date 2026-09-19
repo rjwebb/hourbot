@@ -5,34 +5,29 @@ Opens a Discord category for a fixed window each day, then closes it again.
 Requires: discord.py >= 2.3, Python >= 3.9
 """
 
-from __future__ import annotations
-
+import asyncio
 import datetime as dt
 import logging
 import os
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import tasks
+from dotenv import load_dotenv
+
+load_dotenv()
 
 log = logging.getLogger("hourbot")
 
-
-def _require(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise SystemExit(f"missing required environment variable: {name}")
-    return value
-
-
-TOKEN = _require("DISCORD_TOKEN")
-GUILD_ID = int(_require("GUILD_ID"))
-CATEGORY_ID = int(_require("CATEGORY_ID"))
+TOKEN = os.environ["DISCORD_TOKEN"]
+GUILD_ID = int(os.environ["GUILD_ID"])
+CATEGORY_ID = int(os.environ["CATEGORY_ID"])
 LOBBY_CHANNEL_ID = int(os.environ.get("LOBBY_CHANNEL_ID") or 0)
-TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/London"))
-OPEN_AT = dt.time.fromisoformat(os.environ.get("OPEN_TIME", "21:00"))
-DURATION = dt.timedelta(minutes=int(os.environ.get("OPEN_MINUTES", "60")))
-MODE = os.environ.get("MODE", "hide").lower()
+TZ = ZoneInfo(os.environ.get("TIMEZONE") or "Europe/London")
+OPEN_AT = dt.time.fromisoformat(os.environ.get("OPEN_TIME") or "21:00")
+DURATION = dt.timedelta(minutes=int(os.environ.get("OPEN_MINUTES") or 60))
+MODE = (os.environ.get("MODE") or "hide").lower()
 
 if MODE not in ("hide", "lock"):
     raise SystemExit("MODE must be 'hide' or 'lock'")
@@ -45,25 +40,26 @@ PERM = "view_channel" if MODE == "hide" else "send_messages"
 
 # Boundary times for the scheduler. Attaching a real zone (not a fixed UTC
 # offset) is what keeps the opening hour fixed in local time across DST.
-_CLOSE_AT = (dt.datetime.combine(dt.date(2000, 1, 1), OPEN_AT) + DURATION).time()
+_CLOSE_AT = (dt.datetime.combine(dt.date.min, OPEN_AT) + DURATION).time()
 BOUNDARIES = [OPEN_AT.replace(tzinfo=TZ), _CLOSE_AT.replace(tzinfo=TZ)]
+
 
 def _opening_on(day: dt.date) -> dt.datetime:
     return dt.datetime.combine(day, OPEN_AT, tzinfo=TZ)
 
 
-def is_open(now: dt.datetime) -> bool:
-    """True if now falls inside a window. Checks yesterday too, for windows
-    that run past midnight."""
+def current_window(now: dt.datetime) -> Optional[dt.datetime]:
+    """Start of the window containing now, or None if closed. Checks
+    yesterday's window too, for windows that run past midnight."""
     for offset in (0, -1):
         start = _opening_on(now.date() + dt.timedelta(days=offset))
         if start <= now < start + DURATION:
-            return True
-    return False
+            return start
+    return None
 
 
 def next_opening(now: dt.datetime) -> dt.datetime:
-    for offset in (0, 1, 2):
+    for offset in (0, 1):
         start = _opening_on(now.date() + dt.timedelta(days=offset))
         if start > now:
             return start
@@ -84,12 +80,13 @@ async def apply_state() -> None:
         return
 
     category = guild.get_channel(CATEGORY_ID)
-    if category is None:
-        log.error("channel %s not found", CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
+        log.error("category %s not found", CATEGORY_ID)
         return
 
     now = dt.datetime.now(TZ)
-    want = is_open(now)
+    window = current_window(now)
+    want = window is not None
 
     overwrite = category.overwrites_for(guild.default_role)
     if getattr(overwrite, PERM) is not want:
@@ -101,21 +98,20 @@ async def apply_state() -> None:
         )
         log.info("category now %s (%s=%s)", "open" if want else "closed", PERM, want)
 
-    await update_lobby(guild, want, now)
+    await update_lobby(guild, window, now)
 
 
-async def update_lobby(guild: discord.Guild, open_now: bool, now: dt.datetime) -> None:
+async def update_lobby(
+    guild: discord.Guild, window: Optional[dt.datetime], now: dt.datetime
+) -> None:
     if not LOBBY_CHANNEL_ID:
         return
     channel = guild.get_channel(LOBBY_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         return
 
-    if open_now:
-        closes = _opening_on(now.date()) + DURATION
-        if closes <= now:  # window started yesterday
-            closes = _opening_on(now.date() - dt.timedelta(days=1)) + DURATION
-        topic = f"Open now — closes at {closes:%H:%M %Z}."
+    if window is not None:
+        topic = f"Open now — closes at {window + DURATION:%H:%M %Z}."
     else:
         topic = f"Closed. Opens {next_opening(now):%A %H:%M %Z}."
 
@@ -123,22 +119,25 @@ async def update_lobby(guild: discord.Guild, open_now: bool, now: dt.datetime) -
         await channel.edit(topic=topic, reason="scheduled opening hours")
 
 
-@tasks.loop(time=BOUNDARIES)
-async def on_boundary() -> None:
+async def _apply_safely(what: str) -> None:
     try:
         await apply_state()
     except discord.HTTPException:
-        log.exception("boundary update failed; reconcile loop will retry")
+        log.exception("%s failed", what)
+
+
+@tasks.loop(time=BOUNDARIES)
+async def on_boundary() -> None:
+    # asyncio can wake a hair before the scheduled time; make sure the clock
+    # has actually crossed the boundary before we read it.
+    await asyncio.sleep(1)
+    await _apply_safely("boundary update")
 
 
 @tasks.loop(minutes=10)
 async def reconcile() -> None:
     """Safety net for a boundary missed during a disconnect."""
-    log.info("reconcile: %s", "open" if is_open(dt.datetime.now(TZ)) else "closed")
-    try:
-        await apply_state()
-    except discord.HTTPException:
-        log.exception("reconcile failed")
+    await _apply_safely("reconcile")
 
 
 @on_boundary.before_loop
@@ -152,7 +151,7 @@ async def on_ready() -> None:
     log.info("connected as %s", client.user)
 
     guild = client.get_guild(GUILD_ID)
-    category = guild and guild.get_channel(CATEGORY_ID)
+    category = guild.get_channel(CATEGORY_ID) if guild else None
     if isinstance(category, discord.CategoryChannel):
         stray = [c.name for c in category.channels if not c.permissions_synced]
         if stray:
