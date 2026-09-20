@@ -14,7 +14,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt tzdata
 
-COPY bot.py hours.py .
+# .env.example ships in the image so a registry-only install can extract it:
+#   docker run --rm ghcr.io/rjwebb/hourbot cat .env.example > .env
+COPY bot.py hours.py .env.example .
 
 # The bot only talks outbound to Discord; it doesn't need root for anything.
 RUN useradd --system --no-create-home hourbot

@@ -1,6 +1,5 @@
 .git
 .env
-.env.example
 .venv
 .python-version
 __pycache__
