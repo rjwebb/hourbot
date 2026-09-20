@@ -1,0 +1,13 @@
+.git
+.env
+.env.example
+.venv
+.python-version
+__pycache__
+.mypy_cache
+.pytest_cache
+test_hours.py
+requirements-dev.txt
+Dockerfile
+docker-compose.yml
+.dockerignore

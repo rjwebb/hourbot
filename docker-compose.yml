@@ -1,0 +1,14 @@
+services:
+  hourbot:
+    # Published by .github/workflows/docker.yml on every push to main.
+    # `docker compose build` still builds from source if you need to.
+    image: ghcr.io/rjwebb/hourbot:latest
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
